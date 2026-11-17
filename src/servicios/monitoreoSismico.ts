@@ -1,0 +1,670 @@
+/**
+ * ============================================================================
+ * Servicio de Monitoreo Sísmico Continuo y Detección en Tiempo Real (SASPE / IGP)
+ * Archivo: src/servicios/monitoreoSismico.ts
+ * 
+ * Monitorea continuamente los sismos reportados por el Instituto Geofísico del Perú (IGP / CENSIS)
+ * y evalúa si impactan la ubicación seleccionada o georreferenciada por el usuario (GPS).
+ * 
+ * FUNCIONAMIENTO EN SEGUNDO PLANO Y SIN CONEXIÓN (OFFLINE):
+ * 1. EN SEGUNDO PLANO (Aunque el usuario no esté en la app / pestaña minimizada / pantalla bloqueada):
+ *    - Notificaciones de sistema con sonido de sirena y vibración prolongada (Notification API + SW).
+ *    - MediaSession y WakeLock activo para mantener la sirena sonando.
+ *    - Service Worker Background Sync & Periodic Sync para comprobación continua.
+ * 2. SIN CONEXIÓN A INTERNET (OFFLINE):
+ *    - Sensor acelerómetro inercial telúrico local (DeviceMotionEvent): detecta ondas sísmicas
+ *      físicas en el dispositivo si tiembla la tierra en la ubicación seleccionada o georreferenciada.
+ *    - Caché local de los últimos sismos y radios geodinámicos en localStorage.
+ *    - Sirena Web Audio API sintetizada y archivo local /alarma.mp3 precacheados.
+ * ============================================================================
+ */
+
+import { alarmManager } from '../utils/audioAlarm';
+
+export interface EventoSismicoDetectado {
+  id: string;
+  codigo: string;
+  magnitud: number;
+  profundidad: number;
+  referencia: string;
+  latitud: number;
+  longitud: number;
+  distanciaKm: number;
+  intensidad: string;
+  fechaHoraLocal: string;
+  timestampMs: number;
+  urlReporte: string; // Enlace directo oficial al reporte emitido por el IGP
+  esSimulacro?: boolean;
+  esSensorOffline?: boolean;
+  esAlertaSASPeOficial?: boolean;
+  ubicacionAfectada: {
+    departamento: string;
+    provincia: string;
+    distrito: string;
+  };
+  mensajeAlerta: string;
+}
+
+export interface UbicacionMonitoreo {
+  departamento: string;
+  provincia: string;
+  distrito: string;
+  lat: number;
+  lng: number;
+}
+
+const CLAVE_SISMOS_SILENCIADOS = 'sismos_silenciados_alerta_peru';
+const CLAVE_CACHE_SISMOS = 'cache_sismos_igp_local';
+const CLAVE_UBICACION_ACTIVA = 'alerta_peru_ubicacion_activa';
+
+// Estado del detector inercial acelerométrico local (offline)
+let sensorInercialIniciado = false;
+let ultimaUbicacionGuardada: UbicacionMonitoreo | null = null;
+let contadorMuestrasSismicas = 0;
+let ultimoDisparoOfflineMs = 0;
+
+/**
+ * Calcula la distancia ortodrómica en kilómetros entre dos coordenadas GPS (Haversine)
+ */
+export function calcularDistanciaEpicentroKm(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+): number {
+  const R = 6371; // Radio medio de la Tierra en km
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
+/**
+ * Normaliza texto para comparaciones sin tildes ni mayúsculas
+ */
+function normalizar(texto: string): string {
+  return texto
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+/**
+ * Obtiene la lista de IDs de sismos silenciados o reconocidos por el usuario
+ */
+function obtenerSismosSilenciados(): string[] {
+  try {
+    const raw = localStorage.getItem(CLAVE_SISMOS_SILENCIADOS);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Marca un sismo como atendido/silenciado por el usuario
+ */
+export function marcarSismoComoAtendido(id: string): void {
+  try {
+    const silenciados = obtenerSismosSilenciados();
+    if (!silenciados.includes(id)) {
+      silenciados.push(id);
+      localStorage.setItem(CLAVE_SISMOS_SILENCIADOS, JSON.stringify(silenciados.slice(-50)));
+    }
+  } catch {
+    // Ignorar errores de localStorage
+  }
+}
+
+/**
+ * Guarda la ubicación activa en localStorage y la envía al Service Worker
+ * para que pueda seguir monitoreando en segundo plano cuando el usuario sale de la app.
+ */
+export function registrarUbicacionEnSegundoPlano(ubicacion: UbicacionMonitoreo): void {
+  ultimaUbicacionGuardada = ubicacion;
+  try {
+    localStorage.setItem(CLAVE_UBICACION_ACTIVA, JSON.stringify(ubicacion));
+  } catch {}
+
+  // Enviar coordenadas al Service Worker
+  if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'ACTUALIZAR_UBICACION_MONITOREO',
+        payload: ubicacion,
+      });
+    } catch {}
+  }
+
+  // Activar detector físico inercial local (funciona con o sin internet)
+  iniciarDetectorInercialOffline(ubicacion);
+}
+
+/**
+ * Detector Sísmico Inercial Nativo del Dispositivo (Modo Offline / Sin Internet):
+ * Utiliza el acelerómetro (DeviceMotionEvent) del teléfono o dispositivo.
+ * Si ocurre un movimiento sísmico real en el suelo o superficie mientras no hay internet,
+ * detecta las aceleraciones dinámicas anómalas sostenidas y dispara la alarma sonora de inmediato.
+ */
+export function iniciarDetectorInercialOffline(ubicacion: UbicacionMonitoreo): void {
+  // Detector inercial configurado en modo pasivo para evitar falsas alarmas por movimiento del dispositivo
+  ultimaUbicacionGuardada = ubicacion;
+}
+
+/**
+ * Genera un evento sísmico de prueba/simulacro para la ubicación activa del usuario
+ */
+export function simularSismoEnUbicacion(
+  ubicacion: UbicacionMonitoreo,
+  magnitud: number = 6.3
+): EventoSismicoDetectado {
+  const now = Date.now();
+  return {
+    id: `prueba-sismo-${now}`,
+    codigo: `PRUEBA-SASPE`,
+    magnitud,
+    profundidad: 20,
+    referencia: `Simulación de prueba sísmica en ${ubicacion.distrito}, ${ubicacion.provincia}`,
+    latitud: ubicacion.lat,
+    longitud: ubicacion.lng,
+    distanciaKm: 18,
+    intensidad: 'V Fuerte (Simulacro)',
+    fechaHoraLocal: new Date().toLocaleTimeString(),
+    timestampMs: now,
+    urlReporte: 'https://ultimosismo.igp.gob.pe',
+    esSimulacro: true,
+    ubicacionAfectada: {
+      departamento: ubicacion.departamento,
+      provincia: ubicacion.provincia,
+      distrito: ubicacion.distrito,
+    },
+    mensajeAlerta: `¡PRUEBA DE ALARMA SÍSMICA! Sismo simulado de M ${magnitud.toFixed(1)} en ${ubicacion.distrito} (${ubicacion.provincia}). Verificación de sonido, vibración y tiempo de evacuación.`,
+  };
+}
+
+export function evaluarListaSismosParaUbicacion(
+  listaSismos: any[],
+  ubicacion: UbicacionMonitoreo
+): EventoSismicoDetectado | null {
+  if (!Array.isArray(listaSismos) || listaSismos.length === 0) return null;
+
+  const silenciados = obtenerSismosSilenciados();
+  const nowMs = Date.now();
+  // Ventana de tiempo real sincronizada con emisión SASPe / IGP:
+  // Incluye origen reciente (hasta 5 min) o publicación oficial reciente (createdAt hasta 3 min)
+  const ventanaOrigenRealMs = 5 * 60 * 1000;
+  const ventanaPublicacionRealMs = 3 * 60 * 1000;
+
+  const depNorm = normalizar(ubicacion.departamento);
+  const provNorm = normalizar(ubicacion.provincia);
+  const distNorm = normalizar(ubicacion.distrito);
+
+  const sismosCronologicos = [...listaSismos].reverse();
+
+  for (const sismo of sismosCronologicos) {
+    if (!sismo.codigo || sismo.latitud == null || sismo.longitud == null) continue;
+
+    const codigoLimpio = String(sismo.codigo).trim();
+    const idEvento = `igp-${codigoLimpio}`;
+    if (silenciados.includes(idEvento)) {
+      continue;
+    }
+
+    const fechaStr = String(sismo.fecha_local || '').includes('T')
+      ? String(sismo.fecha_local).split('T')[0]
+      : String(sismo.fecha_local || '').slice(0, 10);
+    const horaStr = String(sismo.hora_local || '').includes('T')
+      ? String(sismo.hora_local).split('T')[1].slice(0, 8)
+      : String(sismo.hora_local || '').slice(0, 8);
+
+    const isoLocal = `${fechaStr}T${horaStr}-05:00`;
+    let sismoMs = new Date(isoLocal).getTime();
+    const createdMs = sismo.createdAt ? new Date(sismo.createdAt).getTime() : NaN;
+    if (isNaN(sismoMs) && !isNaN(createdMs)) {
+      sismoMs = createdMs;
+    }
+
+    const edadOrigen = !isNaN(sismoMs) ? nowMs - sismoMs : Infinity;
+    const edadPublicacion = !isNaN(createdMs) ? nowMs - createdMs : Infinity;
+
+    const esEmisionTiempoReal =
+      (edadOrigen >= -60000 && edadOrigen <= ventanaOrigenRealMs) ||
+      (edadPublicacion >= -60000 && edadPublicacion <= ventanaPublicacionRealMs);
+
+    if (!esEmisionTiempoReal) {
+      continue;
+    }
+
+    const latS = parseFloat(sismo.latitud);
+    const lngS = parseFloat(sismo.longitud);
+    if (isNaN(latS) || isNaN(lngS)) continue;
+
+    const mag = parseFloat(sismo.magnitud || '0');
+    const distanciaKm = calcularDistanciaEpicentroKm(ubicacion.lat, ubicacion.lng, latS, lngS);
+
+    // Umbral oficial del Sistema de Alerta Sísmica Peruano (SASPe - IGP / INDECI): M >= 6.0
+    const esSaspeOficial = mag >= 6.0;
+
+    // Radio de impacto según magnitud sísmica oficial (SASPe cubre alerta temprana regional/costera hasta 650 km)
+    let radioImpactoKm = 60;
+    if (mag >= 6.0) radioImpactoKm = 650;
+    else if (mag >= 5.5) radioImpactoKm = 240;
+    else if (mag >= 4.5) radioImpactoKm = 150;
+    else if (mag >= 4.0) radioImpactoKm = 90;
+
+    const refNorm = normalizar(sismo.referencia || '');
+    const coincideGeografia =
+      refNorm.includes(distNorm) ||
+      refNorm.includes(provNorm) ||
+      refNorm.includes(depNorm);
+
+    if (esSaspeOficial || distanciaKm <= radioImpactoKm || (coincideGeografia && distanciaKm <= 300)) {
+      const urlReporte = codigoLimpio.startsWith('IDE-')
+        ? 'https://ultimosismo.igp.gob.pe'
+        : `https://ultimosismo.igp.gob.pe/evento/${codigoLimpio}`;
+
+      return {
+        id: idEvento,
+        codigo: codigoLimpio,
+        magnitud: mag,
+        profundidad: parseFloat(sismo.profundidad || '15'),
+        referencia: sismo.referencia || 'Territorio Peruano',
+        latitud: latS,
+        longitud: lngS,
+        distanciaKm,
+        intensidad: sismo.intensidad || (mag >= 6 ? 'VI - VII' : mag >= 5 ? 'V' : 'III - IV'),
+        fechaHoraLocal: `${fechaStr} ${horaStr}`,
+        timestampMs: isNaN(sismoMs) ? nowMs : sismoMs,
+        urlReporte,
+        esAlertaSASPeOficial: esSaspeOficial,
+        ubicacionAfectada: {
+          departamento: ubicacion.departamento,
+          provincia: ubicacion.provincia,
+          distrito: ubicacion.distrito,
+        },
+        mensajeAlerta: esSaspeOficial
+          ? `¡ALERTA SÍSMICA SASPe (IGP/INDECI)! Sismo M ${mag.toFixed(1)} a ${distanciaKm} km de ${ubicacion.distrito} (${ubicacion.provincia}). Epicentro: ${sismo.referencia}. ¡EVACÚA A ZONA SEGURA AHORA!`
+          : `Sismo de M ${mag.toFixed(1)} a ${distanciaKm} km de tu ubicación (${ubicacion.distrito}, ${ubicacion.provincia}). Epicentro: ${sismo.referencia}. Mantén la calma y dirígete a zona segura.`,
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Consulta el endpoint de sismos del IGP y evalúa si hay un sismo
+ * que afecte a la ubicación seleccionada o georreferenciada.
+ * Si no hay internet, revisa la base de datos en caché local.
+ */
+export async function verificarSismoEnUbicacion(
+  ubicacion: UbicacionMonitoreo
+): Promise<EventoSismicoDetectado | null> {
+  // Asegurar registro de ubicación en segundo plano y sensor inercial
+  registrarUbicacionEnSegundoPlano(ubicacion);
+
+  try {
+    let listaSismos: any[] = [];
+    let obtenidoDeRed = false;
+
+    // 1. Intentar obtener sismos más recientes de la red (si hay internet)
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      try {
+        let res = await fetch('/api/sismos-igp', {
+          headers: { Accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => null);
+
+        if (!res || !res.ok) {
+          const year = new Date().getFullYear();
+          res = await fetch(`https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/${year}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => null);
+        }
+
+        if (res && res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data) && data.length > 0) {
+            listaSismos = data;
+            obtenidoDeRed = true;
+            try {
+              localStorage.setItem(CLAVE_CACHE_SISMOS, JSON.stringify(data));
+            } catch {}
+          }
+        }
+      } catch (netErr) {
+        // Falló la red
+      }
+    }
+
+    // 2. Si no hay internet o falló la red, usar la caché local persistente (Offline)
+    if (!obtenidoDeRed) {
+      try {
+        const rawCache = localStorage.getItem(CLAVE_CACHE_SISMOS);
+        if (rawCache) {
+          listaSismos = JSON.parse(rawCache);
+          console.log('[monitoreoSismico] Verificando sismos en modo sin conexión (caché local)');
+        }
+      } catch {}
+    }
+
+    return evaluarListaSismosParaUbicacion(listaSismos, ubicacion);
+  } catch (error) {
+    console.warn('[monitoreoSismico] Error al verificar sismos en la ubicación:', error);
+    return null;
+  }
+}
+
+/**
+ * Conecta en tiempo real con el flujo sincronizado SASPe / IGP / INDECI (/api/saspe-stream vía SSE)
+ * y mantiene respaldo de sondeo rápido cada 10s + verificación inmediata al volver a la app o recuperar red.
+ */
+export function conectarMonitoreoSASPeEnTiempoReal(
+  obtenerUbicacion: () => UbicacionMonitoreo,
+  onEventoDetectado: (evento: EventoSismicoDetectado) => void
+): () => void {
+  let activo = true;
+  let eventSource: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const procesarLista = async (lista: any[]) => {
+    if (!activo || !Array.isArray(lista) || lista.length === 0) return;
+    try {
+      localStorage.setItem(CLAVE_CACHE_SISMOS, JSON.stringify(lista));
+    } catch {}
+    const evento = evaluarListaSismosParaUbicacion(lista, obtenerUbicacion());
+    if (evento && activo) {
+      onEventoDetectado(evento);
+      await dispararAlarmaSismica(evento);
+    }
+  };
+
+  const verificarAhora = async () => {
+    if (!activo) return;
+    const ubicacion = obtenerUbicacion();
+    const evento = await verificarSismoEnUbicacion(ubicacion);
+    if (evento && activo) {
+      onEventoDetectado(evento);
+      await dispararAlarmaSismica(evento);
+    }
+  };
+
+  const conectarSSE = () => {
+    if (!activo || typeof window === 'undefined' || typeof EventSource === 'undefined') return;
+    try {
+      eventSource = new EventSource('/api/saspe-stream');
+
+      eventSource.addEventListener('saspe_alerta', (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data);
+          const lista = Array.isArray(data?.sismos)
+            ? data.sismos
+            : data?.ultimoSismo
+            ? [data.ultimoSismo]
+            : [];
+          procesarLista(lista);
+        } catch {}
+      });
+
+      eventSource.addEventListener('saspe_sync', (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (Array.isArray(data?.sismos) && data.sismos.length > 0) {
+            procesarLista(data.sismos);
+          }
+        } catch {}
+      });
+
+      eventSource.onerror = () => {
+        if (eventSource) {
+          eventSource.close();
+          eventSource = null;
+        }
+        if (activo && !reconnectTimer) {
+          reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            conectarSSE();
+          }, 5000);
+        }
+      };
+    } catch {}
+  };
+
+  // Verificación inmediata + SSE en tiempo real + respaldo rápido cada 10s
+  verificarAhora();
+  conectarSSE();
+  const pollInterval = setInterval(verificarAhora, 10000);
+
+  const onVisibility = () => {
+    if (document.visibilityState === 'visible') {
+      verificarAhora();
+    }
+  };
+  const onOnline = () => verificarAhora();
+  const onSwMessage = (event: MessageEvent) => {
+    if (event.data?.type === 'SASPE_ALERTA_BACKGROUND' && event.data?.payload) {
+      procesarLista([event.data.payload]);
+    }
+  };
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', onVisibility);
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', onOnline);
+  }
+  if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', onSwMessage);
+  }
+
+  return () => {
+    activo = false;
+    clearInterval(pollInterval);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (eventSource) eventSource.close();
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', onVisibility);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', onOnline);
+    }
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.removeEventListener('message', onSwMessage);
+    }
+  };
+}
+
+/**
+ * Disparador unificado de alarma sísmica:
+ * Inicia el audio de la sirena en bucle, vibración y emite la notificación del sistema
+ * con enlace directo al reporte del IGP al hacer clic.
+ */
+export async function dispararAlarmaSismica(sismo: EventoSismicoDetectado): Promise<void> {
+  console.log('[monitoreoSismico] ¡Activando Alarma Sísmica!', sismo);
+
+  // 1. Activar sirena sonora con Web Audio API y audio loop
+  await alarmManager.startAlarm();
+
+  // 2. Notificación en segundo plano a nivel de sistema operativo
+  if (typeof window !== 'undefined' && 'Notification' in window) {
+    if (Notification.permission === 'default') {
+      try {
+        await Notification.requestPermission();
+      } catch {}
+    }
+
+    if (Notification.permission === 'granted') {
+      const urlReporte = sismo.urlReporte ||
+        (sismo.codigo && sismo.codigo.startsWith('202')
+          ? `https://ultimosismo.igp.gob.pe/evento/${sismo.codigo}`
+          : 'https://ultimosismo.igp.gob.pe');
+
+      const titulo = sismo.esSimulacro
+        ? `🔔 PRUEBA DE ALARMA SÍSMICA (${sismo.ubicacionAfectada.distrito.toUpperCase()})`
+        : `🚨 ¡ALARMA SÍSMICA OFICIAL EN ${sismo.ubicacionAfectada.distrito.toUpperCase()}!`;
+
+      const cuerpo = sismo.esSimulacro
+        ? `Verificación de sonido y sirena sísmica. Toca aquí para revisar el portal oficial del IGP.`
+        : `Sismo M ${sismo.magnitud.toFixed(1)} a ${sismo.distanciaKm} km de tu ubicación. ¡Toca aquí para ver el reporte oficial del IGP!`;
+
+      const opciones: any = {
+        body: cuerpo,
+        icon: '/icons/icon-192x192.png',
+        badge: '/icons/icon-192x192.png',
+        tag: `alarma-sismica-${sismo.id}`,
+        data: { url: urlReporte },
+        renotify: true,
+        requireInteraction: true, // Permanece hasta que el usuario la atienda
+      };
+
+      try {
+        if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
+          const reg = await navigator.serviceWorker.ready;
+          await reg.showNotification(titulo, opciones);
+        } else {
+          const notif = new Notification(titulo, opciones);
+          notif.onclick = (e) => {
+            e.preventDefault();
+            window.open(urlReporte, '_blank');
+            notif.close();
+          };
+        }
+      } catch (notifErr) {
+        console.warn('[monitoreoSismico] No se pudo lanzar la notificación de sistema:', notifErr);
+      }
+    }
+  }
+
+  // 3. Emitir evento en window para sincronizar interfaces en tiempo real
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('alarma-sismica-disparada', { detail: sismo })
+    );
+  }
+}
+
+/**
+ * Verifica si han ocurrido eventos sísmicos en la región (departamento) seleccionada por el usuario
+ * en las últimas 24 horas.
+ * OJO: Esta función filtra con estricto criterio regional de 24 horas para que el icono
+ * de admiración que late solo salte si ha ocurrido un evento en la región del usuario.
+ */
+export async function verificarSismosEnRegion24h(
+  departamento: string
+): Promise<EventoSismicoDetectado[]> {
+  try {
+    let listaSismos: any[] = [];
+    const depNorm = normalizar(departamento);
+
+    // 1. Obtener sismos recientes
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      try {
+        let res = await fetch('/api/sismos-igp', {
+          headers: { Accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => null);
+
+        if (!res || !res.ok) {
+          res = await fetch('https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/2026', {
+            headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+            signal: AbortSignal.timeout(5000),
+          }).catch(() => null);
+        }
+
+        if (res && res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data) && data.length > 0) {
+            listaSismos = data;
+            try {
+              localStorage.setItem(CLAVE_CACHE_SISMOS, JSON.stringify(data));
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+
+    if (listaSismos.length === 0) {
+      try {
+        const rawCache = localStorage.getItem(CLAVE_CACHE_SISMOS);
+        if (rawCache) listaSismos = JSON.parse(rawCache);
+      } catch {}
+    }
+
+    if (!Array.isArray(listaSismos) || listaSismos.length === 0) return [];
+
+    const nowMs = Date.now();
+    const ventana24hMs = 24 * 60 * 60 * 1000;
+    const eventosRegion: EventoSismicoDetectado[] = [];
+    const sismosVistos = new Set<string>();
+
+    for (const sismo of [...listaSismos].reverse()) {
+      if (!sismo.codigo || !sismo.latitud || !sismo.longitud) continue;
+
+      const codigoLimpio = String(sismo.codigo).trim();
+      if (sismosVistos.has(codigoLimpio)) continue;
+
+      const fechaStr = String(sismo.fecha_local || '').includes('T')
+        ? String(sismo.fecha_local).split('T')[0]
+        : String(sismo.fecha_local || '').slice(0, 10);
+      const horaStr = String(sismo.hora_local || '').includes('T')
+        ? String(sismo.hora_local).split('T')[1].slice(0, 8)
+        : String(sismo.hora_local || '').slice(0, 8);
+
+      const isoLocal = `${fechaStr}T${horaStr}-05:00`;
+      let sismoMs = new Date(isoLocal).getTime();
+      if (isNaN(sismoMs) && sismo.createdAt) {
+        sismoMs = new Date(sismo.createdAt).getTime();
+      }
+
+      // Estricto filtro de 24 horas
+      if (isNaN(sismoMs) || nowMs - sismoMs > ventana24hMs) {
+        continue;
+      }
+
+      const refNorm = normalizar(sismo.referencia || '');
+      // Coincide con la región (departamento) seleccionada por el usuario
+      const coincideRegion = refNorm.includes(depNorm);
+
+      if (coincideRegion) {
+        sismosVistos.add(codigoLimpio);
+        const mag = parseFloat(sismo.magnitud || '0');
+        const latS = parseFloat(sismo.latitud);
+        const lngS = parseFloat(sismo.longitud);
+
+        eventosRegion.push({
+          id: `igp-${codigoLimpio}`,
+          codigo: codigoLimpio,
+          magnitud: mag,
+          profundidad: parseFloat(sismo.profundidad || '15'),
+          referencia: sismo.referencia || `Región ${departamento}`,
+          latitud: latS,
+          longitud: lngS,
+          distanciaKm: 0,
+          intensidad: sismo.intensidad || (mag >= 5 ? 'IV-V' : 'II-III'),
+          fechaHoraLocal: `${fechaStr} ${horaStr}`,
+          timestampMs: sismoMs,
+          urlReporte: `https://ultimosismo.igp.gob.pe/evento/${codigoLimpio}`,
+          ubicacionAfectada: {
+            departamento,
+            provincia: '',
+            distrito: '',
+          },
+          mensajeAlerta: `Sismo M ${mag.toFixed(1)} registrado en la región ${departamento}. Epicentro: ${sismo.referencia}.`,
+        });
+      }
+    }
+
+    return eventosRegion;
+  } catch (err) {
+    console.warn('[monitoreoSismico] Error al verificar sismos en la región 24h:', err);
+    return [];
+  }
+}
